@@ -1,0 +1,6 @@
+einops
+safetensors
+transformers>=4.51
+qwen-vl-utils
+accelerate
+bitsandbytes
