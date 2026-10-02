@@ -4,3 +4,4 @@ slurm-*.out
 *.out
 diag_*.py
 test_*.py
+!tests/test_expression_sprites.py

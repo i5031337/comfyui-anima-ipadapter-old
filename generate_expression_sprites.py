@@ -9,25 +9,43 @@ Usage:
 Examples:
     # 1990s retro anime cel-shaded sprites (default preset):
     python generate_expression_sprites.py \\
+        --ref-image character_reference.png \\
         --character "Rei Ayanami from Neon Genesis Evangelion, white plugsuit" \\
         --style 90s
 
     # Modern high-res digital art sprites:
     python generate_expression_sprites.py \\
+        --ref-image character_reference.png \\
         --character "Rei Ayanami from Neon Genesis Evangelion, white plugsuit" \\
         --style modern
 
     # Quick test generating only the first 2 expressions:
     python generate_expression_sprites.py \\
+        --ref-image character_reference.png \\
         --character "Rei Ayanami from Neon Genesis Evangelion, white plugsuit" \\
         --limit 2
 
     # Generate a single expression by name:
     python generate_expression_sprites.py \\
+        --ref-image character_reference.png \\
         --character "Rei Ayanami from Neon Genesis Evangelion, white plugsuit" \\
         --expression amusement
 
 Arguments:
+    --workflow PATH
+        ComfyUI API-format workflow JSON. Model choices and graph connections
+        come from this file. Default: ./workflows/Expression_Sprites_API.json. Editor-format exports are not supported.
+
+    --list-styles
+        List style presets, aliases, and recommended strengths, then exit.
+
+    --list-expressions
+        List all expressions from --expressions, then exit. Can be combined
+        with --list-styles; ignores --expression and --limit.
+
+    --skip-existing
+        Skip generation when the destination PNG already exists.
+
     --character, -c STR
         Character description and franchise keywords (e.g. "Rei Ayanami from
         Neon Genesis Evangelion, white plugsuit"). Prepend to prompt to activate
@@ -67,15 +85,17 @@ Arguments:
 
     --expressions PATH
         Path to file containing expressions (one per line).
-        Default: "expressions.txt" in the script's directory.
+        Default: "./expressions.txt".
 
     --ref-image NAME
-        Reference character image filename located in ComfyUI's input/ directory.
-        Default: "ComfyUI_00044_.png".
+        Local reference image path (relative to the working directory or absolute),
+        or a filename already in ComfyUI's input/ directory. Existing local files
+        are uploaded to the server once per run.
+        Required for generation; help and list commands do not need it.
 
     --output-dir PATH
         Directory where generated transparent PNG sprites will be saved.
-        Default: "ComfyUI/output/expression_sprites".
+        Default: "../../output/expression_sprites".
 
     --server HOST:PORT
         ComfyUI server address. Default: "127.0.0.1:8188".
@@ -108,12 +128,16 @@ Arguments:
 
 import argparse
 import json
+import mimetypes
 import os
 import shutil
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+
+DEFAULT_WORKFLOW = "./workflows/Expression_Sprites_API.json"
 
 # Rich facial and body language cues tailored to each emotion in expressions.txt
 EXPRESSION_DETAILS = {
@@ -192,13 +216,6 @@ STYLE_ALIASES = {
 
 def parse_expressions(file_path):
     """Parse expressions from expressions.txt, stripping quotes and commas."""
-    if not os.path.exists(file_path):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        alt_path = os.path.join(script_dir, os.path.basename(file_path))
-        if os.path.exists(alt_path):
-            file_path = alt_path
-        else:
-            raise FileNotFoundError(f"Expressions file not found: {file_path}")
     expressions = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -217,6 +234,29 @@ def queue_prompt(server_url, prompt_workflow):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def upload_reference_image(server_url, file_path):
+    """Upload a local file and return its name in ComfyUI's input directory."""
+    boundary = uuid.uuid4().hex
+    filename = os.path.basename(file_path)
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    # Keep the multipart header independent of user-supplied filename characters.
+    upload_name = "reference" + (mimetypes.guess_extension(content_type) or "")
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="image"; filename="{upload_name}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8")
+    with open(file_path, "rb") as f:
+        payload = header + f.read() + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    request = urllib.request.Request(
+        f"http://{server_url}/upload/image", data=payload,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(request) as response:
+        uploaded = json.loads(response.read().decode("utf-8"))
+    return "/".join(part for part in (uploaded.get("subfolder", ""), uploaded["name"]) if part)
+
+
 def wait_for_prompt(server_url, prompt_id, timeout=180):
     """Wait for prompt execution to finish and return (filename, subfolder)."""
     url = f"http://{server_url}/history/{prompt_id}"
@@ -231,9 +271,6 @@ def wait_for_prompt(server_url, prompt_id, timeout=180):
                     if status.get("status_str") == "error":
                         raise RuntimeError(f"ComfyUI Error: {status.get('messages')}")
                     outputs = item.get("outputs", {})
-                    if "9" in outputs and outputs["9"].get("images"):
-                        img = outputs["9"]["images"][0]
-                        return img["filename"], img.get("subfolder", "")
                     for node_id, node_out in outputs.items():
                         images = node_out.get("images", [])
                         for img in images:
@@ -259,8 +296,9 @@ def build_workflow(
     extra_prompt="",
     width=832,
     height=1216,
+    workflow_path=DEFAULT_WORKFLOW,
 ):
-    """Build the API prompt dictionary with rich facial and body cues."""
+    """Load an API workflow and update sprite prompts and generation inputs."""
     details = EXPRESSION_DETAILS.get(
         expression.lower(),
         f"expressive {expression} expression, dynamic upper body posture, expressive body language",
@@ -279,132 +317,58 @@ def build_workflow(
 
     prompt_text = ", ".join(parts) + ".\n\nsimple solid dark grey background, flat background, no shadows"
 
-    return {
-        "26": {
-            "class_type": "UNETLoader",
-            "inputs": {
-                "unet_name": "anima-turbo-v1.1.safetensors",
-                "weight_dtype": "default"
-            }
-        },
-        "23": {
-            "class_type": "AnimaIPAdapterLoader",
-            "inputs": {
-                "ip_adapter_name": "ip_adapter-Character_Reference-10.safetensors",
-                "auto_download": False
-            }
-        },
-        "22": {
-            "class_type": "LoadImage",
-            "inputs": {"image": ref_image_name}
-        },
-        "24": {
-            "class_type": "AnimaIPAdapterApply",
-            "inputs": {
-                "model": ["26", 0],
-                "ip_adapter": ["23", 0],
-                "ref_image": ["22", 0],
-                "strength": strength,
-                "ref_image_size": 512,
-                "siglip_layer": -1,
-                "ip_cfg_scale": 1.0,
-                "ip_cfg_separate": False,
-                "gray_null": False,
-                "use_lora": False
-            }
-        },
-        "19": {
-            "class_type": "CLIPLoader",
-            "inputs": {
-                "clip_name": "qwen_3_06b_base.safetensors",
-                "type": "qwen_image",
-                "device": "default"
-            }
-        },
-        "20": {
-            "class_type": "VAELoader",
-            "inputs": {"vae_name": "qwen_image_vae.safetensors"}
-        },
-        "6": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"clip": ["19", 0], "text": prompt_text}
-        },
-        "7": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"clip": ["19", 0], "text": negative_prompt}
-        },
-        "5": {
-            "class_type": "EmptyLatentImage",
-            "inputs": {"width": width, "height": height, "batch_size": 1}
-        },
-        "3": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["24", 0],
-                "positive": ["6", 0],
-                "negative": ["7", 0],
-                "latent_image": ["5", 0],
-                "seed": seed,
-                "steps": steps,
-                "cfg": cfg,
-                "sampler_name": "euler",
-                "scheduler": "normal",
-                "denoise": 1.0
-            }
-        },
-        "8": {
-            "class_type": "VAEDecode",
-            "inputs": {"samples": ["3", 0], "vae": ["20", 0]}
-        },
-        "34:14": {
-            "class_type": "LoadBackgroundRemovalModel",
-            "inputs": {"bg_removal_name": "birefnet.safetensors"}
-        },
-        "34:13": {
-            "class_type": "RemoveBackground",
-            "inputs": {
-                "bg_removal_model": ["34:14", 0],
-                "image": ["8", 0]
-            }
-        },
-        "35": {
-            "class_type": "InvertMask",
-            "inputs": {"mask": ["34:13", 0]}
-        },
-        "28": {
-            "class_type": "JoinImageWithAlpha",
-            "inputs": {
-                "image": ["8", 0],
-                "alpha": ["35", 0]
-            }
-        },
-        "9": {
-            "class_type": "SaveImage",
-            "inputs": {"images": ["28", 0], "filename_prefix": prefix}
-        }
-    }
+    with open(workflow_path, "r", encoding="utf-8") as f:
+        workflow = json.load(f)
+    if not isinstance(workflow, dict) or "nodes" in workflow or not workflow:
+        raise ValueError("Use a ComfyUI API-format workflow export, not an editor workflow JSON.")
+    if any(not isinstance(node, dict) or "class_type" not in node or "inputs" not in node
+           for node in workflow.values()):
+        raise ValueError("Workflow must contain API nodes with class_type and inputs.")
+
+    def single_node(class_type):
+        matches = [node for node in workflow.values() if node["class_type"] == class_type]
+        if len(matches) != 1:
+            raise ValueError(f"Workflow must contain exactly one {class_type} node.")
+        return matches[0]["inputs"]
+
+    sampler = single_node("KSampler")
+    adapter = single_node("AnimaIPAdapterApply")
+    save = single_node("SaveImage")
+    positive = workflow[str(sampler["positive"][0])]
+    negative = workflow[str(sampler["negative"][0])]
+    if positive is negative:
+        raise ValueError("Positive and negative prompts must use separate CLIPTextEncode nodes.")
+    latent = workflow[str(sampler["latent_image"][0])]
+    reference = workflow[str(adapter["ref_image"][0])]
+    for node, expected in ((positive, "CLIPTextEncode"), (negative, "CLIPTextEncode"),
+                           (latent, "EmptyLatentImage"), (reference, "LoadImage")):
+        if node["class_type"] != expected:
+            raise ValueError(f"Workflow requires a directly connected {expected} node.")
+
+    reference["inputs"]["image"] = ref_image_name
+    positive["inputs"]["text"] = prompt_text
+    negative["inputs"]["text"] = negative_prompt
+    latent["inputs"].update(width=width, height=height)
+    sampler.update(seed=seed, steps=steps, cfg=cfg)
+    adapter["strength"] = strength
+    save["filename_prefix"] = prefix
+    return workflow
 
 
 def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    comfy_root = os.path.dirname(os.path.dirname(script_dir))
-
-    default_expressions = os.path.join(script_dir, "expressions.txt")
-    if not os.path.exists(default_expressions):
-        default_expressions = "./expressions.txt"
-
-    default_output_dir = os.path.join(comfy_root, "output", "expression_sprites")
-
     preset_names = ", ".join(STYLE_PRESETS.keys())
-    parser = argparse.ArgumentParser(description="Generate expressive character sprites with Anima IP-Adapter")
+    parser = argparse.ArgumentParser(
+        description="Generate expressive character sprites with Anima IP-Adapter",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--character", "-c", default="", help="Character description / franchise keywords (e.g. 'Rei Ayanami from Neon Genesis Evangelion, white plugsuit')")
-    parser.add_argument("--style", "-s", default="90s", help=f"Style preset ({preset_names}) or custom style prompt (default: 90s)")
+    parser.add_argument("--style", "-s", default="90s", help=f"Style preset ({preset_names}) or custom style prompt")
     parser.add_argument("--expression", "-e", default=None, help="Generate a single expression by name (e.g. 'amusement', 'joy')")
     parser.add_argument("--extra-prompt", default="", help="Additional prompt keywords to append")
     parser.add_argument("--negative", "-n", default=None, help="Custom negative prompt (defaults to preset's negative prompt)")
-    parser.add_argument("--expressions", default=default_expressions, help="Path to expressions file")
-    parser.add_argument("--ref-image", default="ComfyUI_00044_.png", help="Reference image in ComfyUI/input")
-    parser.add_argument("--output-dir", default=default_output_dir, help="Directory to save sprites")
+    parser.add_argument("--expressions", default="./expressions.txt", help="Path to expressions file")
+    parser.add_argument("--ref-image", help="Local image path or filename in ComfyUI/input (required for generation)")
+    parser.add_argument("--output-dir", default="../../output/expression_sprites", help="Directory to save sprites")
     parser.add_argument("--server", default="127.0.0.1:8188", help="ComfyUI server address")
     parser.add_argument("--seed", type=int, default=42096, help="Seed for character consistency")
     parser.add_argument("--steps", type=int, default=8, help="Sampling steps")
@@ -413,7 +377,24 @@ def main():
     parser.add_argument("--width", type=int, default=832, help="Image width")
     parser.add_argument("--height", type=int, default=1216, help="Image height")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of expressions to generate")
+    parser.add_argument("--workflow", default=DEFAULT_WORKFLOW, help="ComfyUI API-format workflow JSON")
+    parser.add_argument("--list-styles", action="store_true", help="List style presets and aliases, then exit")
+    parser.add_argument("--list-expressions", action="store_true", help="List expressions from --expressions, then exit")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip sprites whose destination PNG already exists")
     args = parser.parse_args()
+
+    if args.list_styles:
+        for name, preset in STYLE_PRESETS.items():
+            aliases = [alias for alias, target in STYLE_ALIASES.items() if target == name]
+            alias_text = f" (aliases: {', '.join(aliases)})" if aliases else ""
+            print(f"{name}{alias_text}: {preset['description']}; strength={preset['default_strength']}")
+    if args.list_expressions:
+        for expression in parse_expressions(args.expressions):
+            print(expression)
+    if args.list_styles or args.list_expressions:
+        return
+    if not args.ref_image or not args.ref_image.strip():
+        parser.error("--ref-image is required for generation")
 
     style_key = STYLE_ALIASES.get(args.style.lower(), args.style.lower())
     if style_key in STYLE_PRESETS:
@@ -436,7 +417,7 @@ def main():
             expressions = expressions[:args.limit]
 
     os.makedirs(args.output_dir, exist_ok=True)
-    comfy_output_dir = os.path.join(comfy_root, "output")
+    comfy_output_dir = "../../output"
 
     print(f"Loaded {len(expressions)} expressions.")
     print(f"Character: {args.character or '(none specified, relying on reference image)'}")
@@ -447,11 +428,26 @@ def main():
     print(f"Output directory: {args.output_dir}")
     print(f"Sampling: seed={args.seed}, steps={args.steps}, cfg={args.cfg}, size={args.width}x{args.height}\n")
 
+    skipped = 0
+    saved_count = 0
+    ref_image_name = None
     for i, expr in enumerate(expressions, 1):
+        dest_filename = f"sprite_{expr}.png" if args.expression else f"sprite_{i:02d}_{expr}.png"
+        dest_path = os.path.join(args.output_dir, dest_filename)
+        if args.skip_existing and os.path.isfile(dest_path):
+            print(f"[{i}/{len(expressions)}] Skipping existing: {dest_filename}")
+            skipped += 1
+            continue
+        if ref_image_name is None:
+            local_image = os.path.expanduser(args.ref_image)
+            if os.path.isfile(local_image):
+                ref_image_name = upload_reference_image(args.server, local_image)
+            else:
+                ref_image_name = args.ref_image
         prefix = f"sprites/expr_{expr}"
         print(f"[{i}/{len(expressions)}] Generating expression: '{expr}' ...")
         workflow = build_workflow(
-            ref_image_name=args.ref_image,
+            ref_image_name=ref_image_name,
             expression=expr,
             seed=args.seed,
             steps=args.steps,
@@ -464,14 +460,12 @@ def main():
             extra_prompt=args.extra_prompt,
             width=args.width,
             height=args.height,
+            workflow_path=args.workflow,
         )
         resp = queue_prompt(args.server, workflow)
         prompt_id = resp["prompt_id"]
 
         filename, subfolder = wait_for_prompt(args.server, prompt_id)
-        dest_filename = f"sprite_{expr}.png" if args.expression else f"sprite_{i:02d}_{expr}.png"
-        dest_path = os.path.join(args.output_dir, dest_filename)
-
         candidates = [
             os.path.join(comfy_output_dir, subfolder, filename),
             os.path.join(comfy_output_dir, filename),
@@ -496,10 +490,16 @@ def main():
                     with open(dest_path, "wb") as f:
                         f.write(r.read())
                 print(f"  -> Saved {dest_filename}")
+                saved = True
             except Exception as e:
                 print(f"  -> Generated: {filename} (could not copy to {dest_filename}: {e})")
 
-    print(f"\nAll {len(expressions)} expression sprites successfully generated in {args.output_dir}!")
+        saved_count += int(saved)
+
+    failed = len(expressions) - skipped - saved_count
+    print(f"\nSaved {saved_count}, skipped {skipped}, failed to save {failed}. Output: {args.output_dir}")
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

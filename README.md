@@ -127,22 +127,117 @@ Drag and drop this JSON file directly into the ComfyUI web interface to start ge
 
 ## Generating Expression Sprites
 
-The included [`generate_expression_sprites.py`](generate_expression_sprites.py) script automates generating full emotion sprite sheets for all 28 expressions in [`expressions.txt`](expressions.txt).
+The included [`generate_expression_sprites.py`](generate_expression_sprites.py) script generates individual transparent PNG sprites for all 28 expressions in [`expressions.txt`](expressions.txt), a custom expression list, or a single expression.
+
+### Setup
+
+Start ComfyUI with this extension loaded and run the commands below from this repository's directory. All default filesystem paths are relative to the current working directory. `--ref-image` is required for generation and accepts a local relative or absolute image path, or a filename already in the server's `ComfyUI/input/` directory. If the value names an existing local file, the script uploads it to ComfyUI once per run and uses the returned filename. Otherwise, it passes the value through as a server input filename. Help and list commands do not require a reference image.
+
+The script loads [`workflows/Expression_Sprites_API.json`](workflows/Expression_Sprites_API.json). This template requires these models to be available under the exact loader names:
+
+- Diffusion model: `anima-turbo-v1.1.safetensors` (the default API template uses `UNETLoader`).
+- IP-Adapter: `ip_adapter-Character_Reference-10.safetensors`, with the SigLIP2 encoder already installed (`auto_download` is disabled).
+- Text encoder: `qwen_3_06b_base.safetensors`.
+- VAE: `qwen_image_vae.safetensors`.
+- Background removal: `birefnet.safetensors`, with the `LoadBackgroundRemovalModel` and `RemoveBackground` nodes installed.
+
+To use your own models or a GGUF loader, configure and test your workflow in ComfyUI, then export it in **API format** and save it under `workflows/`. Use `--workflow ./workflows/my_sprites_api.json` to select it, or replace the default API template. Enable ComfyUI's developer options if the API export command is hidden. The editor workflow `Anima_Turbo_IPAdapter.json` is a different format and cannot be passed directly to this script.
+
+Your API workflow must contain exactly one `KSampler`, `AnimaIPAdapterApply`, and `SaveImage`. The sampler's positive and negative inputs must connect directly to separate `CLIPTextEncode` nodes, its latent input to `EmptyLatentImage`, and the adapter's reference input to `LoadImage`. Node IDs can differ from the template. The script updates those prompts, the reference filename, seed, steps, CFG, strength, width, height, and save prefix; other settings, models, and connections come from your JSON. Keep batch size at one for one sprite per expression. Include background-removal and alpha nodes if you want transparent PNGs.
+
+### Examples
 
 ```bash
-# Generate all 28 expressions:
+# Generate all 28 expressions with the default 90s style:
 python generate_expression_sprites.py --ref-image character_reference.png
 
-# Custom options:
+# Discover available styles and expressions without contacting ComfyUI:
+python generate_expression_sprites.py --list-styles --list-expressions
+
+# Resume a batch using your own API workflow:
+python generate_expression_sprites.py \
+  --ref-image character_reference.png \
+  --workflow ./workflows/my_sprites_api.json \
+  --skip-existing
+
+# Quick test with a character description and modern style:
+python generate_expression_sprites.py \
+  --ref-image character_reference.png \
+  --character "Rei Ayanami from Neon Genesis Evangelion, white plugsuit" \
+  --style modern \
+  --limit 2
+
+# Generate a single expression using the visual-novel preset:
+python generate_expression_sprites.py \
+  --ref-image character_reference.png \
+  --expression amusement \
+  --style vn
+
+# Custom expression list, style prompt, and sampling settings:
 python generate_expression_sprites.py \
   --ref-image my_character.png \
+  --expressions ./my_expressions.txt \
+  --style "watercolor anime illustration, soft pastel colors" \
+  --extra-prompt "waist-up portrait, looking at viewer" \
+  --negative "blurry, artifacts" \
   --output-dir ./sprites_output \
-  --strength 0.72 \
-  --seed 42096
+  --server 127.0.0.1:8188 \
+  --strength 0.65 \
+  --seed 42096 \
+  --steps 8 \
+  --cfg 1.0 \
+  --width 832 \
+  --height 1216
 ```
 
-### Tip for Vivid Expressions & Body Language
-- **Strength 0.70 – 0.75**: Using `strength=0.72` prevents the reference image from locking down the pose and facial expression, allowing full body language (raised arms, fists, shock postures) and dramatic facial expressions while preserving 100% of character identity.
+### Command-Line Options
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `--help`, `-h` | — | Show help and exit. |
+| `--workflow` PATH | `./workflows/Expression_Sprites_API.json` | Load a ComfyUI API-format workflow; model choices come from this JSON. |
+| `--list-styles` | Off | List preset descriptions, aliases, and recommended strengths, then exit. |
+| `--list-expressions` | Off | List all expressions from `--expressions`, then exit. Can be combined with `--list-styles`; does not apply `--limit` or `--expression`. |
+| `--skip-existing` | Off | Skip generation when the destination PNG exists; file numbering is preserved. Checks filenames only, not whether settings match or the image is valid. |
+| `--character`, `-c` TEXT | Empty | Character description and franchise keywords prepended to the positive prompt. |
+| `--style`, `-s` TEXT | `90s` | Style preset, alias, or custom style prompt text (see below). |
+| `--expression`, `-e` NAME | Unset | Generate one expression; overrides `--expressions` and ignores `--limit`. |
+| `--extra-prompt` TEXT | Empty | Additional keywords appended after character, style, and expression cues. |
+| `--negative`, `-n` TEXT | Style-dependent | Override the negative prompt; use `--negative ""` for an empty prompt. |
+| `--expressions` PATH | `./expressions.txt` | Expression file, one expression per line; surrounding quotes and commas are stripped. |
+| `--ref-image` PATH/NAME | Required for generation | Local image path to upload (relative, absolute, or `~/…`), or an existing server input filename. Local files take precedence; always overrides the workflow's reference image. |
+| `--output-dir` PATH | `../../output/expression_sprites` | Destination for copied or downloaded PNGs; created automatically. Resolves to `ComfyUI/output/expression_sprites` when run from this repository in `ComfyUI/custom_nodes/`. |
+| `--server` HOST:PORT | `127.0.0.1:8188` | ComfyUI server address, without `http://`; the script uses HTTP. |
+| `--seed` INT | `42096` | Random seed reused for every expression. |
+| `--steps` INT | `8` | Sampling steps. |
+| `--cfg` FLOAT | `1.0` | Diffusion CFG scale. |
+| `--strength` FLOAT | Style-dependent | Override the preset's IP-Adapter conditioning weight. |
+| `--width` INT | `832` | Output canvas width in pixels. |
+| `--height` INT | `1216` | Output canvas height in pixels. |
+| `--limit` INT | Unset (all) | Generate the first N expressions from the file. Currently, `0` leaves the list unlimited and negative values use Python slicing. |
+
+### Style Presets
+
+Preset names and aliases are case-insensitive. Any other string becomes custom style prompt text.
+
+| Preset | Aliases | Style | Default strength | Default negative prompt |
+| --- | --- | --- | --- | --- |
+| `90s` | `retro`, `vintage`, `classic` | Retro cel-shaded anime | `0.55` | Empty |
+| `modern` | — | Detailed digital anime with vibrant coloring | `0.72` | `low quality, blurry, worst quality, artifacts` |
+| `visual-novel` | `vn` | Polished dialogue sprite with clean linework | `0.65` | `low quality, blurry, worst quality, artifacts` |
+| `cinematic` | — | Atmospheric anime lighting and shading | `0.60` | `low quality, blurry, worst quality, artifacts` |
+| `raw` | `none` | No added style tokens | `0.70` | Empty |
+| Custom text | — | Your supplied style prompt | `0.65` | `low quality, blurry, worst quality, artifacts` |
+
+`--strength` and `--negative` override these defaults independently. Start with the preset's strength and adjust to balance character likeness with expression and pose freedom; results vary with the reference image and prompt.
+
+### Expressions and Saved Files
+
+The bundled expressions include tailored facial and body-language cues. Custom expression names are also accepted and receive generic expression and posture cues. The script adds a flat dark-grey background prompt; the default API template removes the background to produce transparency.
+
+List mode saves `sprite_01_admiration.png`, `sprite_02_amusement.png`, and so on in file order. Single-expression mode saves `sprite_amusement.png`. Reusing the same destination filenames overwrites earlier sprites unless `--skip-existing` is set. ComfyUI also saves the original generated files under `output/sprites/`.
+
+For a remote server, required models must be installed on that server. Local reference images are uploaded through `/upload/image`; existing server input filenames can also be used. The script can download results through ComfyUI's `/view` endpoint when it cannot find them locally. Each expression has a fixed 180-second completion timeout.
 
 ---
 
