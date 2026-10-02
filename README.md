@@ -119,7 +119,7 @@ huggingface-cli download circlestone-labs/Anima split_files/vae/qwen_image_vae.s
 ## Workflow
 
 A complete, pre-configured workflow is included:
-- [`workflows/Anima_Turbo_IPAdapter.json`](workflows/Anima_Turbo_IPAdapter.json)
+- [`workflows/Expression_Sprites_API.json.json`](workflows/Expression_Sprites_API.json.json)
 
 Drag and drop this JSON file directly into the ComfyUI web interface to start generating!
 
